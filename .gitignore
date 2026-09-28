@@ -1,0 +1,18 @@
+/target
+**/*.rs.bk
+*.pdb
+
+# Coverage / profiling artifacts
+/coverage
+*.profraw
+*.profdata
+
+# Fuzz corpus + artifacts (detached workspace under fuzz/)
+fuzz/target
+fuzz/corpus
+fuzz/artifacts
+fuzz/Cargo.lock
+
+# Parity-corpus captures that are regenerated locally (never the checked-in
+# goldens themselves).
+tests/parity/**/actual.*
