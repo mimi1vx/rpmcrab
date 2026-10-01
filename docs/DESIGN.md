@@ -421,7 +421,9 @@ plus, where one exists, a linked upstream issue.
 - **`--json`** — the single most valuable *additive* feature. rpmlint has no
   machine-readable output (long-open RFEs), so every consumer greps human text.
   A stable JSON stream is new surface, added without touching the text format.
-- **A real man page.** rpmlint has none (upstream #1077, open since 2023).
+- **A real man page.** rpmlint has none (upstream #1077, open since 2023);
+  rpmcrab ships one, generated from the CLI definition by `rpmcrab-gen`
+  and drift-checked in CI.
 - **Spellcheck backend.** `pyenchant` has no direct Rust equivalent; the
   `spelling-error` check's backend is free to differ or to degrade gracefully.
 - **`--time-report` cosmetics** (not consumed by tooling).
@@ -519,7 +521,12 @@ workspace = true`, `unsafe_code = "forbid"`, no `[workspace.dependencies]`.
   the check registry and all checks, and the external-tool probes.
 - **`rpmcrab`** — lib + bin. The clap CLI replicating every rpmlint flag, the
   exit-code mapping, signal handling, and the feature-gated `rpmcrab-gen`
-  generator for man pages and completions.
+  generator, which emits the man page and shell completions checked in under
+  `crates/rpmcrab/{man,completions}` (drift enforced by the `assets-drift`
+  CI job). The assets are generated, committed and drift-checked but not yet
+  installed by any packaging step — `release.yml` ships the binary only;
+  wiring them into the tarball/spec is a pending packaging decision, recorded
+  here so it is not implicit.
 
 Dependency direction is one-way (`rpmcrab → rpmcrab-core`), enforced by
 `scripts/check-rust-layering.sh`.
