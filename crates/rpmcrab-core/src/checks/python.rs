@@ -36,6 +36,46 @@ struct Requirement {
     extras: Vec<String>,
 }
 
+/// Find the byte index of a top-level `and`/`or` operator, skipping quoted
+/// strings and parenthesized groups.
+fn find_top_level(expr: &str, op: &str) -> Option<usize> {
+    let mut depth = 0;
+    let mut in_quote: Option<char> = None;
+    let bytes = expr.as_bytes();
+    let op_bytes = op.as_bytes();
+    let mut i = 0;
+    while i + op_bytes.len() <= bytes.len() {
+        let c = bytes[i] as char;
+        if let Some(q) = in_quote {
+            if c == q {
+                in_quote = None;
+            }
+            i += 1;
+            continue;
+        }
+        if c == '"' || c == '\'' {
+            in_quote = Some(c);
+            i += 1;
+            continue;
+        }
+        if c == '(' {
+            depth += 1;
+        } else if c == ')' {
+            depth -= 1;
+        }
+        if depth == 0 && &bytes[i..i + op_bytes.len()] == op_bytes {
+            let before = i == 0 || !bytes[i - 1].is_ascii_alphanumeric();
+            let after = i + op_bytes.len() >= bytes.len()
+                || !bytes[i + op_bytes.len()].is_ascii_alphanumeric();
+            if before && after {
+                return Some(i);
+            }
+        }
+        i += 1;
+    }
+    None
+}
+
 impl PythonCheck {
     /// Fallback `python_version` marker value (the reference uses the
     /// interpreter running rpmlint; the port has no interpreter to ask).
@@ -211,11 +251,60 @@ impl PythonCheck {
 
     /// Evaluate the common environment markers. Unknown markers are treated
     /// as holding (the reference evaluates the full PEP 508 environment; we
-    /// cover `python_version`, `sys_platform`, and `extra`).
+    /// cover `python_version`, `sys_platform`, `os_name`, `platform_system`,
+    /// and `extra`).
+    ///
+    /// For the missing-requirement check the reference skips any requirement
+    /// whose marker mentions `extra` (`'extra' in str(req.marker)`), so an
+    /// extra marker never holds here.
     fn marker_holds(marker: &str, python_version: &str) -> bool {
         let marker = marker.trim();
         // `extra == "..."` means an optional dependency: skip it.
         if marker.contains("extra") {
+            return false;
+        }
+        Self::marker_atom_holds(marker, python_version)
+    }
+
+    /// Detect a malformed marker: unbalanced parentheses or unterminated
+    /// quotes. The reference (`packaging`) is fail-closed on these
+    /// (`InvalidRequirement` drops the requirement); we return false.
+    fn is_malformed_marker(expr: &str) -> bool {
+        let mut depth = 0;
+        let mut in_quote: Option<char> = None;
+        for c in expr.chars() {
+            if let Some(q) = in_quote {
+                if c == q {
+                    in_quote = None;
+                }
+                continue;
+            }
+            match c {
+                '"' | '\'' => in_quote = Some(c),
+                '(' => depth += 1,
+                ')' => {
+                    depth -= 1;
+                    if depth < 0 {
+                        return true;
+                    }
+                }
+                _ => {}
+            }
+        }
+        depth != 0 || in_quote.is_some()
+    }
+
+    /// Evaluate a single non-boolean marker comparison (no `and`/`or`/`not`).
+    /// The reference evaluates markers with the full PEP 508 environment,
+    /// pinning `os_name='posix'` and `platform_system='Linux'`
+    /// (`PythonCheck.py:139-143`); the port mirrors that for the keys it
+    /// knows and fails closed for the remaining `default_environment()`
+    /// keys (ledgered in `divergences.toml`). A variable that is not a PEP
+    /// 508 environment key is still treated as holding. Malformed markers
+    /// are fail-closed (false), matching `packaging`.
+    fn marker_atom_holds(atom: &str, python_version: &str) -> bool {
+        let atom = atom.trim();
+        if Self::is_malformed_marker(atom) {
             return false;
         }
         // python_version comparisons, e.g. `python_version < "3.10"`.
@@ -224,7 +313,7 @@ impl PythonCheck {
             Regex::new(r#"python_version\s*(==|!=|<=|>=|<|>)\s*["']([\d.]+)["']"#)
                 .expect("static regex")
         });
-        if let Some(caps) = pv_re.captures(marker).ok().flatten() {
+        if let Some(caps) = pv_re.captures(atom).ok().flatten() {
             let op = caps.get(1).map(|m| m.as_str()).unwrap_or("");
             let want = caps.get(2).map(|m| m.as_str()).unwrap_or("");
             let cmp = compare_versions(python_version, want);
@@ -238,12 +327,138 @@ impl PythonCheck {
                 _ => true,
             };
         }
+        // `extra` is never provided: `packaging` evaluates markers with
+        // `extra == ""`, so only `extra == ""` holds.
+        if let Some(holds) = Self::string_marker_holds(atom, "extra", "") {
+            return holds;
+        }
         // sys_platform, e.g. `sys_platform != "win32"`.
-        if marker.contains("sys_platform") {
+        if atom.contains("sys_platform") {
             // We are always on Linux here.
-            return !marker.contains("win32") || marker.contains("!=");
+            return !atom.contains("win32") || atom.contains("!=");
+        }
+        // The port only ever runs on Linux, mirroring the reference's
+        // pinned environment.
+        if let Some(holds) = Self::string_marker_holds(atom, "os_name", "posix") {
+            return holds;
+        }
+        if let Some(holds) = Self::string_marker_holds(atom, "platform_system", "Linux") {
+            return holds;
+        }
+        // The remaining `default_environment()` keys are not evaluated:
+        // fail closed rather than guess.
+        for key in [
+            "implementation_name",
+            "implementation_version",
+            "platform_machine",
+            "platform_release",
+            "platform_version",
+            "python_full_version",
+            "platform_python_implementation",
+        ] {
+            if atom.contains(key) {
+                return false;
+            }
         }
         true
+    }
+
+    /// Evaluate a `var == "value"` / `var != "value"` comparison against a
+    /// pinned value. Returns `None` when the atom is not such a comparison.
+    fn string_marker_holds(atom: &str, var: &str, pinned: &str) -> Option<bool> {
+        let pattern = format!(r#"{var}\s*(==|!=)\s*["']([^"']*)["']"#);
+        let re = Regex::new(&pattern).expect("static regex");
+        let caps = re.captures(atom).ok().flatten()?;
+        let op = caps.get(1).map(|m| m.as_str()).unwrap_or("");
+        let want = caps.get(2).map(|m| m.as_str()).unwrap_or("");
+        match op {
+            "==" => Some(want == pinned),
+            "!=" => Some(want != pinned),
+            _ => None,
+        }
+    }
+
+    /// Evaluate a marker for the leftover-requirements check.
+    ///
+    /// Unlike [`Self::marker_holds`], the reference does not skip
+    /// extra-marked requirements here: it evaluates the marker with the
+    /// full PEP 508 environment. `extra` is never provided, so
+    /// [`Self::marker_atom_holds`] evaluates `extra` comparisons against
+    /// `""` (verified against `packaging.markers`).
+    fn marker_holds_leftover(marker: &str, python_version: &str) -> bool {
+        Self::eval_marker_expr(marker, python_version)
+    }
+
+    /// Strip one layer of parentheses, returning `None` unless the `(` at
+    /// index 0 is matched by the final `)`. Depth-tracked: `(a) or (b)`
+    /// starts with `(` and ends with `)` without the outer pair wrapping
+    /// the whole expression, and must not be stripped. (The caller already
+    /// rejected unbalanced input via [`Self::is_malformed_marker`].)
+    fn strip_outer_parens(expr: &str) -> Option<&str> {
+        let bytes = expr.as_bytes();
+        if bytes.len() < 2 || bytes[0] != b'(' || bytes[bytes.len() - 1] != b')' {
+            return None;
+        }
+        let mut depth = 0;
+        let mut in_quote: Option<u8> = None;
+        for (i, &b) in bytes.iter().enumerate() {
+            if let Some(q) = in_quote {
+                if b == q {
+                    in_quote = None;
+                }
+                continue;
+            }
+            match b {
+                b'"' | b'\'' => in_quote = Some(b),
+                b'(' => depth += 1,
+                b')' => {
+                    depth -= 1;
+                    if depth == 0 && i != bytes.len() - 1 {
+                        return None;
+                    }
+                }
+                _ => {}
+            }
+        }
+        Some(&expr[1..expr.len() - 1])
+    }
+
+    /// Evaluate a boolean marker expression with `and`/`or`/`not` over the
+    /// single comparisons [`Self::marker_atom_holds`] understands.
+    fn eval_marker_expr(expr: &str, python_version: &str) -> bool {
+        let expr = expr.trim();
+        // Fail-closed on malformed markers, matching `packaging`.
+        if Self::is_malformed_marker(expr) {
+            return false;
+        }
+        // Strip one layer of outer parentheses, but only when the `(` at
+        // index 0 is matched by the final `)`. A bare first/last-character
+        // check mangles `(a) or (b)` into `a) or (b)`.
+        if let Some(inner) = Self::strip_outer_parens(expr) {
+            return Self::eval_marker_expr(inner, python_version);
+        }
+        // `or` binds loosest.
+        if let Some(idx) = find_top_level(expr, "or") {
+            return Self::eval_marker_expr(&expr[..idx], python_version)
+                || Self::eval_marker_expr(&expr[idx + 2..], python_version);
+        }
+        // Then `and`.
+        if let Some(idx) = find_top_level(expr, "and") {
+            return Self::eval_marker_expr(&expr[..idx], python_version)
+                && Self::eval_marker_expr(&expr[idx + 3..], python_version);
+        }
+        // `not` prefix.
+        if let Some(rest) = expr.strip_prefix("not ") {
+            return !Self::eval_marker_expr(rest, python_version);
+        }
+        let expr = expr.trim();
+        if expr == "true" {
+            return true;
+        }
+        if expr == "false" {
+            return false;
+        }
+        Self::marker_atom_holds(expr, python_version)
     }
 
     /// The `python_version` marker environment, mirroring the reference:
@@ -465,10 +680,12 @@ impl PythonCheck {
         }
 
         // Leftover requirements: python-foo in RPM requires with no match.
+        // Extra markers are evaluated here, not skipped: the reference
+        // runs the full PEP 508 environment over them.
         let mut wanted: Vec<String> = Vec::new();
         for req in reqs {
             if let Some(m) = &req.marker
-                && !Self::marker_holds(m, python_version)
+                && !Self::marker_holds_leftover(m, python_version)
             {
                 continue;
             }
@@ -528,6 +745,159 @@ mod tests {
         // `foo` has an extra marker, which marker_holds rejects.
         assert!(reqs.iter().any(|r| r.name == "foo"));
         assert!(!PythonCheck::marker_holds("extra == \"test\"", "3.12"));
+    }
+
+    #[test]
+    fn leftover_extra_markers_are_evaluated_not_skipped() {
+        // Emission-path test through `check_requirements`: the reference
+        // evaluates `extra` markers in the leftover path with the full PEP 508
+        // environment, where `extra` is never provided. `extra == "test"` is
+        // false (requirement not wanted → leftover if the RPM requires it);
+        // `extra != "test"` is true (requirement wanted → no leftover).
+        // Verified against `packaging.markers` and the reference end-to-end.
+        let content = "Metadata-Version: 2.1\nRequires-Dist: w6extra; extra == \"test\"\n";
+        let reqs = PythonCheck::parse_requirements(content, true, "3.12");
+        let findings = check_requirements_findings(&reqs, &["python3-w6extra"]);
+        assert_eq!(findings.len(), 1, "unexpected findings: {findings:?}");
+        let (name, level, line) = &findings[0];
+        assert_eq!(name, "python-leftover-require");
+        assert_eq!(*level, Level::Warning);
+        assert!(line.contains("python3-w6extra"), "detail: {line}");
+
+        // `extra != "test"` holds, so the requirement is wanted: no leftover.
+        let content = "Metadata-Version: 2.1\nRequires-Dist: w6extra; extra != \"test\"\n";
+        let reqs = PythonCheck::parse_requirements(content, true, "3.12");
+        let findings = check_requirements_findings(&reqs, &["python3-w6extra"]);
+        assert!(findings.is_empty(), "unexpected findings: {findings:?}");
+    }
+
+    #[test]
+    fn marker_boolean_evaluator_handles_parenthesised_operands() {
+        // Direct tests for the `and`/`or` evaluator added by this change.
+        // Expected values verified against `packaging` with
+        // python_version=3.12, os_name=posix. `os_name`/`platform_system`
+        // are pinned to the reference's Linux environment, so the cases
+        // below are comparable on both sides.
+        let cases = [
+            ("(python_version >= \"3.9\") or (os_name == \"nt\")", true),
+            (
+                "(python_version >= \"3.9\") and (os_name == \"posix\")",
+                true,
+            ),
+            (
+                "(python_version < \"3.9\") or (python_version > \"4.0\")",
+                false,
+            ),
+            (
+                "(python_version >= \"3.9\") and (python_version < \"3.10\")",
+                false,
+            ),
+            ("((python_version >= \"3.9\"))", true),
+            ("(python_version >= \"3.9\")", true),
+            (
+                "(python_version < \"3.0\") or (python_version >= \"3.9\") and (python_version < \"3.13\")",
+                true,
+            ),
+        ];
+        for (marker, expected) in cases {
+            assert_eq!(
+                PythonCheck::eval_marker_expr(marker, "3.12"),
+                expected,
+                "marker: {marker}"
+            );
+        }
+    }
+
+    #[test]
+    fn leftover_parenthesised_markers_are_evaluated() {
+        // Emission-path test through `check_requirements`: a top-level
+        // boolean with parenthesised operands must not be mangled by paren
+        // stripping. Both markers hold for python_version 3.12 (verified
+        // against `packaging`), so the requirements are wanted and no
+        // `python-leftover-require` fires. With the old first/last-char
+        // stripping the expression becomes malformed, evaluates false, and
+        // a bogus leftover finding is emitted.
+        for marker in [
+            "(python_version >= \"3.9\") or (os_name == \"nt\")",
+            "(python_version >= \"3.9\") and (os_name == \"posix\")",
+        ] {
+            let content = format!("Metadata-Version: 2.1\nRequires-Dist: w6paren; {marker}\n");
+            let reqs = PythonCheck::parse_requirements(&content, true, "3.12");
+            let findings = check_requirements_findings(&reqs, &["python3-w6paren"]);
+            assert!(
+                findings.is_empty(),
+                "marker {marker}: unexpected findings: {findings:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn leftover_false_parenthesised_marker_still_fires() {
+        // The paren fix must not make everything true: a parenthesised
+        // marker that genuinely does not hold still yields the leftover.
+        let content = "Metadata-Version: 2.1\nRequires-Dist: w6paren; (python_version < \"3.9\") or (python_version > \"4.0\")\n";
+        let reqs = PythonCheck::parse_requirements(content, true, "3.12");
+        let findings = check_requirements_findings(&reqs, &["python3-w6paren"]);
+        assert_eq!(findings.len(), 1, "unexpected findings: {findings:?}");
+        let (name, level, line) = &findings[0];
+        assert_eq!(name, "python-leftover-require");
+        assert_eq!(*level, Level::Warning);
+        assert!(line.contains("python3-w6paren"), "detail: {line}");
+    }
+
+    #[test]
+    fn leftover_empty_extra_marker_holds() {
+        // `packaging` evaluates markers with `extra == ""`, so
+        // `extra == ""` holds and the requirement is wanted: no leftover.
+        // The old substitution treated every `extra == "<anything>"` as
+        // false, emitting a false `python-leftover-require`. Expected
+        // values verified against `packaging.markers`.
+        assert!(PythonCheck::marker_holds_leftover("extra == \"\"", "3.12"));
+        assert!(!PythonCheck::marker_holds_leftover("extra != \"\"", "3.12"));
+        assert!(!PythonCheck::marker_holds_leftover(
+            "extra == \"test\"",
+            "3.12"
+        ));
+        assert!(PythonCheck::marker_holds_leftover(
+            "extra != \"test\"",
+            "3.12"
+        ));
+        // Emission path: `extra == ""` holds, so no finding.
+        let content = "Metadata-Version: 2.1\nRequires-Dist: w6ext; extra == \"\"\n";
+        let reqs = PythonCheck::parse_requirements(content, true, "3.12");
+        let findings = check_requirements_findings(&reqs, &["python3-w6ext"]);
+        assert!(findings.is_empty(), "unexpected findings: {findings:?}");
+    }
+
+    #[test]
+    fn marker_pinned_linux_environment() {
+        // The reference pins `os_name='posix'` and `platform_system='Linux'`
+        // (`PythonCheck.py:139-143`); the port only ever runs on Linux.
+        // Expected values verified against `packaging` with the reference
+        // environment.
+        assert!(PythonCheck::marker_atom_holds(
+            "os_name == \"posix\"",
+            "3.12"
+        ));
+        assert!(!PythonCheck::marker_atom_holds("os_name == \"nt\"", "3.12"));
+        assert!(PythonCheck::marker_atom_holds("os_name != \"nt\"", "3.12"));
+        assert!(PythonCheck::marker_atom_holds(
+            "platform_system == \"Linux\"",
+            "3.12"
+        ));
+        assert!(!PythonCheck::marker_atom_holds(
+            "platform_system == \"Windows\"",
+            "3.12"
+        ));
+        // The remaining `default_environment()` keys fail closed.
+        assert!(!PythonCheck::marker_atom_holds(
+            "platform_machine == \"x86_64\"",
+            "3.12"
+        ));
+        assert!(!PythonCheck::marker_atom_holds(
+            "python_full_version == \"3.12.1\"",
+            "3.12"
+        ));
     }
 
     #[test]
