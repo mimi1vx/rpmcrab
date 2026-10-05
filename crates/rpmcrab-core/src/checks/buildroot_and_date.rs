@@ -199,12 +199,41 @@ mod tests {
         use std::process::Command;
         use time::{OffsetDateTime, UtcOffset};
 
-        // Child mode: print `today_string()` for the parent to read.
-        if std::env::var("RPMCRAB_TZ_PROBE_CHILD").is_ok() {
+        // Child mode: print `today_string()` for the parent to read. The
+        // value must be exactly "1": merely being set (e.g. a stray export in
+        // the ambient environment) must not divert the parent into the child
+        // path, where the test would pass trivially.
+        if std::env::var("RPMCRAB_TZ_PROBE_CHILD").as_deref() == Ok("1") {
+            // Fail loudly when the zone does not resolve: without tzdata
+            // `now_local()` silently falls back to UTC, and the date
+            // comparison below would then fail exactly like a genuine
+            // now_local()/now_utc() regression. Asserting the resolved
+            // offset matches the offset the parent requested keeps the
+            // two failure modes distinguishable.
+            let expected_secs: i32 = std::env::var("RPMCRAB_TZ_PROBE_OFFSET_SECS")
+                .expect("parent must pass RPMCRAB_TZ_PROBE_OFFSET_SECS")
+                .parse()
+                .expect("offset seconds must be an integer");
+            let resolved = OffsetDateTime::now_local()
+                .expect("now_local() failed outright")
+                .offset();
+            assert_eq!(
+                resolved.whole_seconds(),
+                expected_secs,
+                "TZ={:?} did not resolve to the requested offset; tzdata may be missing",
+                std::env::var("TZ").unwrap_or_default()
+            );
             println!("RPMCRAB-TODAY: {}", today_string());
             return;
         }
 
+        // A stray `RPMCRAB_TZ_PROBE_CHILD` in the ambient environment would
+        // otherwise make the parent take the child path above and pass
+        // trivially. Fail loudly instead.
+        assert!(
+            std::env::var("RPMCRAB_TZ_PROBE_CHILD").is_err(),
+            "RPMCRAB_TZ_PROBE_CHILD must not be set in the ambient environment"
+        );
         let now = OffsetDateTime::now_utc();
         // NB: POSIX inverts the sign — `Etc/GMT-14` is UTC+14.
         let (tz_name, offset) =
@@ -213,11 +242,24 @@ mod tests {
             } else {
                 ("Etc/GMT+12", UtcOffset::from_hms(-12, 0, 0).unwrap())
             };
+        // `module_path!()` carries the crate name (`rpmcrab_core::...`) which
+        // the test harness omits from test names; strip it so a module rename
+        // or move keeps the child filter in sync instead of silently matching
+        // zero tests.
+        let module = module_path!();
+        let test_path = module
+            .split_once("::")
+            .map(|(_, rest)| rest)
+            .unwrap_or(module);
         let out = Command::new(std::env::current_exe().unwrap())
             .arg("--exact")
-            .arg("checks::buildroot_and_date::tests::today_string_follows_local_timezone")
+            .arg(format!("{test_path}::today_string_follows_local_timezone"))
             .arg("--nocapture")
             .env("RPMCRAB_TZ_PROBE_CHILD", "1")
+            .env(
+                "RPMCRAB_TZ_PROBE_OFFSET_SECS",
+                offset.whole_seconds().to_string(),
+            )
             .env("TZ", tz_name)
             .output()
             .expect("spawn tz probe");
