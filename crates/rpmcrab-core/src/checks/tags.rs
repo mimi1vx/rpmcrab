@@ -16,6 +16,7 @@ use librpm::{OwnedTagData, Tag};
 
 use super::is_match;
 use super::shared::{devel_regex, lib_package_regex, macro_regex};
+use super::spdx::suggest_licenses;
 use crate::check::{Check, add_info};
 use crate::config::Config;
 use crate::filter::Filter;
@@ -1161,6 +1162,12 @@ impl TagsCheck {
             return;
         }
         let mut valid_license = true;
+        // Did-you-mean suggestions are the port's own Info finding, not the
+        // reference's: cap them per package so a pathological License tag
+        // with thousands of invalid ids cannot burn minutes in edit-distance
+        // computation. The invalid-license warnings themselves are untouched.
+        let mut spellchecks_emitted = 0;
+        const MAX_SPELLCHECK_SUGGESTIONS: usize = 10;
         if !self.valid_licenses.contains(&rpm_license.to_string()) {
             // Pieces are validated like the reference's nested loop: each
             // piece the split yields is checked, and a non-valid piece is
@@ -1191,6 +1198,19 @@ impl TagsCheck {
                 for l2 in Self::split_license(&lic) {
                     if !self.valid_licenses.contains(&l2) {
                         add_info(out, Level::Warning, pkg, "invalid-license", &[&l2]);
+                        if spellchecks_emitted < MAX_SPELLCHECK_SUGGESTIONS {
+                            spellchecks_emitted += 1;
+                            let suggestions = suggest_licenses(&l2, 3);
+                            if !suggestions.is_empty() {
+                                add_info(
+                                    out,
+                                    Level::Info,
+                                    pkg,
+                                    "invalid-license-spellcheck",
+                                    &[&format!("{l2}: {}", suggestions.join(", "))],
+                                );
+                            }
+                        }
                         valid_license = false;
                     }
                 }
@@ -1476,7 +1496,7 @@ mod tests {
         for (name, line) in &results {
             assert!(!name.is_empty(), "finding name: {line}");
             assert!(
-                line.contains(": E: ") || line.contains(": W: "),
+                line.contains(": E: ") || line.contains(": W: ") || line.contains(": I: "),
                 "level: {line}"
             );
         }
@@ -1855,6 +1875,23 @@ mod tests {
         out.results().to_vec()
     }
 
+    fn invalid_license_warnings(results: Vec<(String, String)>) -> Vec<(String, String)> {
+        // The `invalid-license-spellcheck` info finding accompanies every
+        // invalid-license warning; these tests pin the warning itself. The
+        // total is asserted so an unexpected extra finding cannot slip past
+        // the filter unnoticed.
+        for (name, _) in &results {
+            assert!(
+                name == "invalid-license" || name == "invalid-license-spellcheck",
+                "unexpected finding: {name}"
+            );
+        }
+        results
+            .into_iter()
+            .filter(|(n, _)| n == "invalid-license")
+            .collect()
+    }
+
     #[test]
     fn license_split_matches_reference() {
         // Expectations verified against the reference's
@@ -1917,13 +1954,12 @@ mod tests {
     fn license_empty_paren_group_is_reported() {
         // The reference reports `W: invalid-license ()` for an empty
         // group: the leaf must not vanish.
-        let results = license_findings("()");
-        assert_eq!(results.len(), 1);
-        assert_eq!(results[0].0, "invalid-license");
-        assert_eq!(results[0].1, "fcprobe.noarch: W: invalid-license ()");
-        let results = license_findings("MIT and ()");
-        assert_eq!(results.len(), 1);
-        assert_eq!(results[0].1, "fcprobe.noarch: W: invalid-license ()");
+        let warnings = invalid_license_warnings(license_findings("()"));
+        assert_eq!(warnings.len(), 1);
+        assert_eq!(warnings[0].1, "fcprobe.noarch: W: invalid-license ()");
+        let warnings = invalid_license_warnings(license_findings("MIT and ()"));
+        assert_eq!(warnings.len(), 1);
+        assert_eq!(warnings[0].1, "fcprobe.noarch: W: invalid-license ()");
         // A whitespace-only group vanishes, like the reference's
         // empty-split filtering.
         assert!(license_findings("( )").is_empty());
@@ -1945,19 +1981,17 @@ mod tests {
     fn license_doubly_wrapped_parens_are_reported() {
         // The reference flags the unbalanced pieces of `((GPLv2))`; the
         // splitter must not silently accept them.
-        let results = license_findings("((GPLv2))");
-        assert_eq!(results.len(), 2);
-        assert_eq!(results[0].0, "invalid-license");
-        assert_eq!(results[0].1, "fcprobe.noarch: W: invalid-license (GPLv2");
-        assert_eq!(results[1].0, "invalid-license");
-        assert_eq!(results[1].1, "fcprobe.noarch: W: invalid-license )");
+        let warnings = invalid_license_warnings(license_findings("((GPLv2))"));
+        assert_eq!(warnings.len(), 2);
+        assert_eq!(warnings[0].1, "fcprobe.noarch: W: invalid-license (GPLv2");
+        assert_eq!(warnings[1].1, "fcprobe.noarch: W: invalid-license )");
         // Neighbouring unbalanced shapes agree with the reference too.
-        let results = license_findings("((GPLv2)");
-        assert_eq!(results.len(), 1);
-        assert_eq!(results[0].1, "fcprobe.noarch: W: invalid-license (GPLv2");
-        let results = license_findings("(GPLv2))");
-        assert_eq!(results.len(), 1);
-        assert_eq!(results[0].1, "fcprobe.noarch: W: invalid-license )");
+        let warnings = invalid_license_warnings(license_findings("((GPLv2)"));
+        assert_eq!(warnings.len(), 1);
+        assert_eq!(warnings[0].1, "fcprobe.noarch: W: invalid-license (GPLv2");
+        let warnings = invalid_license_warnings(license_findings("(GPLv2))"));
+        assert_eq!(warnings.len(), 1);
+        assert_eq!(warnings[0].1, "fcprobe.noarch: W: invalid-license )");
     }
 
     #[test]
@@ -1987,7 +2021,8 @@ mod tests {
         // `and MIT` after a WITH expression used to be dropped entirely.
         let results =
             license_findings("GPL-2.0-only WITH Classpath-exception-2.0 and BogusLicense");
-        let names: Vec<&str> = results.iter().map(|(n, _)| n.as_str()).collect();
+        let warnings = invalid_license_warnings(results);
+        let names: Vec<&str> = warnings.iter().map(|(n, _)| n.as_str()).collect();
         assert_eq!(names, vec!["invalid-license"]);
     }
 
@@ -1999,12 +2034,48 @@ mod tests {
 
     #[test]
     fn license_plain_invalid_is_reported() {
-        let results = license_findings("BogusLicense-1.0");
-        assert_eq!(results.len(), 1);
-        assert_eq!(results[0].0, "invalid-license");
+        let warnings = invalid_license_warnings(license_findings("BogusLicense-1.0"));
+        assert_eq!(warnings.len(), 1);
+        assert_eq!(warnings[0].0, "invalid-license");
         assert_eq!(
-            results[0].1,
+            warnings[0].1,
             "fcprobe.noarch: W: invalid-license BogusLicense-1.0"
+        );
+    }
+
+    #[test]
+    fn invalid_license_emits_spellcheck_suggestions() {
+        // Upstream rpm-software-management/rpmlint#818: did-you-mean for
+        // invalid licenses. Info-level so it can never break a build.
+        let results = license_findings("GPL-2.0-or-latr");
+        assert_eq!(
+            results,
+            vec![
+                (
+                    "invalid-license".to_string(),
+                    "fcprobe.noarch: W: invalid-license GPL-2.0-or-latr".to_string(),
+                ),
+                (
+                    "invalid-license-spellcheck".to_string(),
+                    "fcprobe.noarch: I: invalid-license-spellcheck GPL-2.0-or-latr: GPL-2.0-or-later, GPL-1.0-or-later, GPL-3.0-or-later"
+                        .to_string(),
+                ),
+            ]
+        );
+    }
+
+    #[test]
+    fn invalid_license_spellcheck_matches_upstream_example() {
+        // The #818 reporter's own example: "Apache 2" should point at Apache-2.0.
+        let results = license_findings("Apache 2");
+        assert_eq!(
+            results
+                .iter()
+                .find(|(n, _)| n == "invalid-license-spellcheck")
+                .map(|(_, l)| l.as_str()),
+            Some(
+                "fcprobe.noarch: I: invalid-license-spellcheck Apache 2: Apache-2.0, Apache-1.0, Apache-1.1"
+            ),
         );
     }
 }
