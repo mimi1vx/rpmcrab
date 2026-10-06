@@ -565,6 +565,7 @@ pub struct SpecCheck {
     autosetup_re: Regex,
     autosetup_n_re: Regex,
     autopatch_re: Regex,
+    patch_applying_macros: Vec<String>,
     filelist_re: Regex,
     pkgname_re: Regex,
     tarball_re: Regex,
@@ -616,6 +617,16 @@ impl SpecCheck {
         let valid_groups = config
             .configuration
             .get("ValidGroups")
+            .and_then(toml::Value::as_array)
+            .map(|a| {
+                a.iter()
+                    .filter_map(|v| v.as_str().map(str::to_string))
+                    .collect()
+            })
+            .unwrap_or_default();
+        let patch_applying_macros = config
+            .configuration
+            .get("PatchApplyingMacros")
             .and_then(toml::Value::as_array)
             .map(|a| {
                 a.iter()
@@ -684,6 +695,7 @@ impl SpecCheck {
             autosetup_re: autosetup_re().clone(),
             autosetup_n_re: autosetup_n_re().clone(),
             autopatch_re: autopatch_re().clone(),
+            patch_applying_macros,
             filelist_re: filelist_re().clone(),
             pkgname_re: pkgname_re().clone(),
             tarball_re: tarball_re().clone(),
@@ -1035,6 +1047,7 @@ impl SpecCheck {
         self.checkline_make_check(pkg, out, line);
         self.checkline_setup(pkg, out, line);
         self.checkline_autopatch(pkg, out, line);
+        self.checkline_patch_applying_macros(pkg, out, line);
         self.checkline_applied_patch(pkg, out, line);
         self.checkline_sourcedir(pkg, out, line);
         self.checkline_configure(pkg, out, line);
@@ -1232,6 +1245,45 @@ impl SpecCheck {
             self.patches_auto_applied = true;
             if self.current_section != "prep" {
                 self.info(out, pkg, Level::Warning, "%autopatch-not-in-prep", &[]);
+            }
+        }
+    }
+
+    fn checkline_patch_applying_macros(&mut self, pkg: &SpecPkg, out: &mut Filter, line: &str) {
+        // Upstream rpmlint#1074: wrapper macros like Fedora's %forgeautosetup
+        // apply patches just like %autosetup does. The list lives in the
+        // config (PatchApplyingMacros) so distros can extend it; %autosetup
+        // and %autopatch keep their dedicated handling above.
+        let stripped = line.trim_start();
+        let Some(rest) = stripped.strip_prefix('%') else {
+            return;
+        };
+        for name in &self.patch_applying_macros {
+            // An empty name would match a bare "%" line and wrongly quiet
+            // patch-not-applied; skip it.
+            if name.is_empty() {
+                continue;
+            }
+            if let Some(after) = rest.strip_prefix(name.as_str())
+                && (after.is_empty() || after.starts_with(char::is_whitespace))
+            {
+                // Mirror %autosetup: -N means the patches are NOT applied.
+                let applies = !self.autosetup_n_re.is_match(after).unwrap_or(false);
+                let not_in_prep = self.current_section != "prep";
+                let name = name.clone();
+                if applies {
+                    self.patches_auto_applied = true;
+                }
+                if not_in_prep {
+                    self.info(
+                        out,
+                        pkg,
+                        Level::Warning,
+                        &format!("%{name}-not-in-prep"),
+                        &[],
+                    );
+                }
+                return;
             }
         }
     }
@@ -2506,6 +2558,149 @@ make install
             !has(&modern, "patch-macro-old-format"),
             "results: {modern:?}"
         );
+    }
+
+    #[test]
+    fn forgeautosetup_counts_as_patch_applying_ref1074() {
+        // Upstream rpmlint#1074: %forgeautosetup wraps %autosetup, so patches
+        // are deemed applied and patch-not-applied stays quiet. (The shipped
+        // default lists it in PatchApplyingMacros; the test config inserts
+        // the key explicitly because Config::default() carries no table.)
+        let mut config = config_mini();
+        config.configuration.insert(
+            "PatchApplyingMacros".into(),
+            toml::Value::Array(vec![toml::Value::String("forgeautosetup".into())]),
+        );
+        let results = run_with(
+            "Name: foo
+Patch0: foo.patch
+%prep
+%forgeautosetup
+%build
+",
+            &config,
+        );
+        let quiet = lines_for(&results, "patch-not-applied");
+        assert!(quiet.is_empty(), "results: {results:?}");
+        // Without any patch-applying macro the finding still fires, with
+        // name, level and detail pinned.
+        let bare = run_mini(
+            "Name: foo
+Patch0: foo.patch
+%prep
+%build
+",
+        );
+        let lines = lines_for(&bare, "patch-not-applied");
+        assert_eq!(lines.len(), 1, "results: {bare:?}");
+        assert!(
+            lines[0].contains("W: patch-not-applied Patch0:"),
+            "line: {}",
+            lines[0]
+        );
+    }
+
+    #[test]
+    fn patch_applying_macros_list_is_config_extensible() {
+        // A distro-specific wrapper added to PatchApplyingMacros is honored.
+        let mut config = config_mini();
+        config.configuration.insert(
+            "PatchApplyingMacros".into(),
+            toml::Value::Array(vec![toml::Value::String("myapplypatches".into())]),
+        );
+        let results = run_with(
+            "Name: foo
+Patch0: foo.patch
+%prep
+%myapplypatches
+%build
+",
+            &config,
+        );
+        let quiet = lines_for(&results, "patch-not-applied");
+        assert!(quiet.is_empty(), "results: {results:?}");
+    }
+
+    #[test]
+    fn patch_applying_macro_dash_n_means_not_applied_ref1074() {
+        // Mirror %autosetup: -N means the patches are NOT applied, so the
+        // finding fires even though the wrapper macro is present.
+        let mut config = config_mini();
+        config.configuration.insert(
+            "PatchApplyingMacros".into(),
+            toml::Value::Array(vec![toml::Value::String("forgeautosetup".into())]),
+        );
+        let results = run_with(
+            "Name: foo
+Patch0: foo.patch
+%prep
+%forgeautosetup -N
+%build
+",
+            &config,
+        );
+        let lines = lines_for(&results, "patch-not-applied");
+        assert_eq!(lines.len(), 1, "results: {results:?}");
+        assert!(
+            lines[0].contains("W: patch-not-applied Patch0:"),
+            "line: {}",
+            lines[0]
+        );
+    }
+
+    #[test]
+    fn empty_patch_applying_macro_name_is_ignored_ref1074() {
+        // A [""] entry must not let a bare "%" line suppress the finding.
+        let mut config = config_mini();
+        config.configuration.insert(
+            "PatchApplyingMacros".into(),
+            toml::Value::Array(vec![toml::Value::String("".into())]),
+        );
+        let results = run_with(
+            "Name: foo
+Patch0: foo.patch
+%prep
+%
+%build
+",
+            &config,
+        );
+        let lines = lines_for(&results, "patch-not-applied");
+        assert_eq!(lines.len(), 1, "results: {results:?}");
+        assert!(
+            lines[0].contains("W: patch-not-applied Patch0:"),
+            "line: {}",
+            lines[0]
+        );
+    }
+
+    #[test]
+    fn patch_applying_macro_outside_prep_warns_ref1074() {
+        // Mirror %autopatch: the wrapper outside %prep warns (with its own
+        // name in the finding) while still counting the patches as applied.
+        let mut config = config_mini();
+        config.configuration.insert(
+            "PatchApplyingMacros".into(),
+            toml::Value::Array(vec![toml::Value::String("forgeautosetup".into())]),
+        );
+        let results = run_with(
+            "Name: foo
+Patch0: foo.patch
+%prep
+%build
+%forgeautosetup
+",
+            &config,
+        );
+        let lines = lines_for(&results, "%forgeautosetup-not-in-prep");
+        assert_eq!(lines.len(), 1, "results: {results:?}");
+        assert!(
+            lines[0].contains("W: %forgeautosetup-not-in-prep"),
+            "line: {}",
+            lines[0]
+        );
+        let quiet = lines_for(&results, "patch-not-applied");
+        assert!(quiet.is_empty(), "results: {results:?}");
     }
 
     #[test]
