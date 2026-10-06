@@ -1525,24 +1525,6 @@ impl BinariesCheck {
         }
     }
 
-    fn check_executable_shlib(
-        &self,
-        pkg: &Pkg,
-        pkgfile: &PkgFile,
-        info: &ReadelfInfo,
-        out: &mut Filter,
-    ) {
-        if pkgfile.mode & 0o111 == 0 && info.is_shlib {
-            add_info(
-                out,
-                Level::Error,
-                pkg,
-                "shared-library-not-executable",
-                &[&pkgfile.name],
-            );
-        }
-    }
-
     fn check_optflags(&self, pkg: &Pkg, pkgfile: &PkgFile, config: &Config, out: &mut Filter) {
         if self.is_archive {
             return;
@@ -1705,7 +1687,6 @@ impl BinariesCheck {
         self.check_rpath(pkg, pkgfile, &info, out);
         self.check_library_dependency(pkg, pkgfile, &info, out);
         self.check_forbidden_functions(pkg, pkgfile, &info, config, out);
-        self.check_executable_shlib(pkg, pkgfile, &info, out);
         self.check_optflags(pkg, pkgfile, config, out);
         self.check_hash_sections(pkg, pkgfile, &info, out);
         self.check_no_patchable_function_entries_in_archive(pkg, pkgfile, &info, out);
@@ -3327,34 +3308,27 @@ description = "explicit priority string bypasses the system crypto policy"
     }
 
     #[test]
-    fn shared_library_not_executable() {
+    fn non_executable_shlib_stays_quiet() {
+        // shared-library-not-executable was deliberately dropped (upstream rpmlint#596):
+        // a 0644 shared library must stay quiet through the full emission path.
+        let dir = tempfile::TempDir::new().expect("tmpdir");
+        let rpm_path = fixture_path("rpmcrab-binaries-fixture-1.0-1.aarch64.rpm");
+        let mut pkg =
+            Pkg::open(std::path::Path::new(&rpm_path), dir.path(), true).expect("open fixture");
+        let mut found = false;
+        for f in pkg.files.iter_mut() {
+            if f.name == "/usr/lib64/libgood.so.1" {
+                f.mode = 0o100644;
+                found = true;
+            }
+        }
+        assert!(found, "libgood.so.1 missing from fixture");
         let config = test_config();
-        let check = BinariesCheck::with_tool_dir(&config, None);
-        let pkg = synthetic_pkg("testpkg", "x86_64", vec![]);
-        let mut info = syn_info();
-        info.is_shlib = true;
-        let mut pkgfile = syn_file("/usr/lib64/libfoo.so.1", "ELF 64-bit LSB shared object");
-        pkgfile.mode = 0o100644;
+        let mut check = BinariesCheck::with_tool_dir(&config, None);
         let mut out = Filter::new(&config, Color::for_tty(false)).unwrap();
-        check.check_executable_shlib(&pkg, &pkgfile, &info, &mut out);
+        check.check_binary(&pkg, &config, &mut out);
         let results = out.results().to_vec();
-        let lines = lines_for(&results, "shared-library-not-executable");
-        assert_eq!(lines.len(), 1, "exactly one finding: {results:?}");
-        assert!(lines[0].contains(" E: "), "Error level: {}", lines[0]);
-        assert!(
-            lines[0].contains("/usr/lib64/libfoo.so.1"),
-            "detail: {}",
-            lines[0]
-        );
-
-        pkgfile.mode = 0o100755;
-        let mut out = Filter::new(&config, Color::for_tty(false)).unwrap();
-        check.check_executable_shlib(&pkg, &pkgfile, &info, &mut out);
-        assert!(
-            out.results().is_empty(),
-            "executable shlib must be quiet: {:?}",
-            out.results()
-        );
+        assert_lacks(&results, "shared-library-not-executable");
     }
 
     #[test]
