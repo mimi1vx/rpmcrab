@@ -705,3 +705,179 @@ fn explain_fhs_description_override_from_config() {
     );
     assert!(out.stderr.is_empty());
 }
+
+fn binaries_fixture_rpm() -> std::path::PathBuf {
+    Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join(
+            "../../tests/fixtures/binaries-check/input/rpmcrab-binaries-fixture-1.0-1.aarch64.rpm",
+        )
+        .canonicalize()
+        .expect("binaries fixture is committed")
+}
+
+/// End-to-end `[SeverityOverrides]` through the real binary: the fixture RPM
+/// fires `executable-stack` at Error; the override rewrites it to Warning on
+/// stdout, proving the TOML key flows through config load into the filter.
+#[test]
+fn severity_override_rewrites_finding_level_end_to_end() {
+    let rpm = binaries_fixture_rpm();
+    let baseline = rpmcrab(&[rpm.to_str().unwrap()]);
+    let baseline_out = String::from_utf8_lossy(&baseline.stdout);
+    assert!(
+        baseline_out.contains("E: executable-stack"),
+        "baseline must fire executable-stack at E: {baseline_out}"
+    );
+
+    let dir = tempfile::tempdir().unwrap();
+    let cfg = dir.path().join("overrides.toml");
+    std::fs::write(&cfg, "[SeverityOverrides]\nexecutable-stack = \"W\"\n").unwrap();
+    let out = rpmcrab(&["-c", cfg.to_str().unwrap(), rpm.to_str().unwrap()]);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        stdout.contains("W: executable-stack"),
+        "override must rewrite the level: {stdout}"
+    );
+    assert!(
+        !stdout.contains("E: executable-stack"),
+        "no E: executable-stack may remain: {stdout}"
+    );
+}
+
+/// An override name that never matches a finding warns on stderr (not as a
+/// finding): no static registry of finding tags exists, so a never-matched
+/// name is the typo signal.
+#[test]
+fn unused_severity_override_warns_on_stderr() {
+    let rpm = binaries_fixture_rpm();
+    let dir = tempfile::tempdir().unwrap();
+    let cfg = dir.path().join("overrides.toml");
+    std::fs::write(&cfg, "[SeverityOverrides]\nno-such-finding = \"E\"\n").unwrap();
+    let out = rpmcrab(&["-c", cfg.to_str().unwrap(), rpm.to_str().unwrap()]);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("unused [SeverityOverrides] entry \"no-such-finding\""),
+        "stderr: {stderr}"
+    );
+}
+
+/// A non-table `SeverityOverrides` is a fatal configuration error (exit 1),
+/// not a silent empty map.
+#[test]
+fn non_table_severity_overrides_is_fatal() {
+    let dir = tempfile::tempdir().unwrap();
+    let cfg = dir.path().join("bad.toml");
+    std::fs::write(&cfg, "SeverityOverrides = \"nope\"\n").unwrap();
+    let out = rpmcrab(&["-c", cfg.to_str().unwrap(), "-p"]);
+    assert_eq!(out.status.code(), Some(1));
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("fatal error in configuration"),
+        "stderr: {stderr}"
+    );
+}
+
+/// The exit code follows the overridden levels end to end (DESIGN \u00a74.6):
+/// in strict mode every native error-level finding (enumerated from a
+/// non-strict `--format json` baseline) is overridden to W, so the only
+/// remaining errors are strict promotions of the non-overridden native
+/// warnings/infos -- every printed error is a promotion, so the run exits
+/// 65, not 64.
+#[test]
+fn severity_override_exit_code_follows_rewritten_levels() {
+    use std::collections::HashSet;
+    let rpm = binaries_fixture_rpm();
+    // Non-strict baseline: permissive by default, so exit 0; the JSON
+    // findings give the native levels.
+    let baseline = rpmcrab(&["--format", "json", rpm.to_str().unwrap()]);
+    assert_eq!(baseline.status.code(), Some(0));
+    let doc: serde_json::Value =
+        serde_json::from_str(&String::from_utf8_lossy(&baseline.stdout)).expect("JSON");
+    let findings: Vec<serde_json::Value> = doc["findings"].as_array().expect("findings").to_vec();
+    // Strict promotes warnings and infos alike; a finding whose check is
+    // overridden never counts as promoted, even when it would promote.
+    let overridden: HashSet<&str> = findings
+        .iter()
+        .filter(|f| f["level"] == "E")
+        .map(|f| f["check"].as_str().expect("check"))
+        .collect();
+    let promoted: Vec<&str> = findings
+        .iter()
+        .filter(|f| {
+            (f["level"] == "W" || f["level"] == "I")
+                && !overridden.contains(f["check"].as_str().expect("check"))
+        })
+        .map(|f| f["check"].as_str().expect("check"))
+        .collect();
+    assert!(!overridden.is_empty(), "baseline must fire error findings");
+    assert!(!promoted.is_empty(), "baseline must fire warnings");
+
+    let dir = tempfile::tempdir().unwrap();
+    let cfg = dir.path().join("overrides.toml");
+    let mut toml = String::from("[SeverityOverrides]\n");
+    let mut overridden_sorted: Vec<&str> = overridden.iter().copied().collect();
+    overridden_sorted.sort_unstable();
+    for check in &overridden_sorted {
+        // Quoted key: finding names are arbitrary strings, never dotted tables.
+        toml.push_str(&format!("{check:?} = \"W\"\n"));
+    }
+    std::fs::write(&cfg, toml).unwrap();
+
+    let out = rpmcrab(&[
+        "--format",
+        "json",
+        "-s",
+        "-c",
+        cfg.to_str().unwrap(),
+        rpm.to_str().unwrap(),
+    ]);
+    assert_eq!(out.status.code(), Some(65));
+    let rerun: serde_json::Value =
+        serde_json::from_str(&String::from_utf8_lossy(&out.stdout)).expect("JSON");
+    assert_eq!(rerun["summary"]["errors"], promoted.len() as u64);
+    for f in rerun["findings"].as_array().expect("findings") {
+        let check = f["check"].as_str().expect("check");
+        match f["level"].as_str().expect("level") {
+            "E" => assert!(
+                !overridden.contains(check),
+                "every printed error must be a strict promotion: {f}"
+            ),
+            "W" => assert!(
+                overridden.contains(check),
+                "every warning must be an overridden native error: {f}"
+            ),
+            other => panic!("unexpected level {other} for {check}"),
+        }
+    }
+}
+
+/// `--format json` reports the overridden level end to end: the JSON `level`
+/// wire letter follows the `[SeverityOverrides]` rewrite through the real
+/// binary.
+#[test]
+fn severity_override_json_reports_overridden_level() {
+    let rpm = binaries_fixture_rpm();
+    let dir = tempfile::tempdir().unwrap();
+    let cfg = dir.path().join("overrides.toml");
+    std::fs::write(&cfg, "[SeverityOverrides]\nexecutable-stack = \"W\"\n").unwrap();
+    let out = rpmcrab(&[
+        "--format",
+        "json",
+        "-c",
+        cfg.to_str().unwrap(),
+        rpm.to_str().unwrap(),
+    ]);
+    let doc: serde_json::Value =
+        serde_json::from_str(&String::from_utf8_lossy(&out.stdout)).expect("JSON");
+    let levels: Vec<&str> = doc["findings"]
+        .as_array()
+        .expect("findings")
+        .iter()
+        .filter(|f| f["check"] == "executable-stack")
+        .map(|f| f["level"].as_str().expect("level"))
+        .collect();
+    assert!(!levels.is_empty(), "fixture must fire executable-stack");
+    assert!(
+        levels.iter().all(|l| *l == "W"),
+        "overridden levels: {levels:?}"
+    );
+}

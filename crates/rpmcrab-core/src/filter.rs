@@ -20,10 +20,13 @@ use crate::level::Level;
 pub struct Filter {
     strict: bool,
     scoring: HashMap<String, toml::Value>,
+    severity_overrides: HashMap<String, Level>,
     filter_titles: HashSet<String>,
     blocked_filters: HashSet<String>,
     filters: Vec<Regex>,
     used_filters: HashSet<String>,
+    /// `[SeverityOverrides]` names that matched at least one emitted finding.
+    used_overrides: HashSet<String>,
     info: bool,
     color: Color,
     /// `(check_name, rendered line)` pairs in emission order. The check name is
@@ -79,10 +82,12 @@ impl Filter {
         Ok(Self {
             strict: config.strict,
             scoring: config.scoring.clone(),
+            severity_overrides: config.severity_overrides.clone(),
             filter_titles: config.filter_titles.iter().cloned().collect(),
             blocked_filters: config.blocked_filters.iter().cloned().collect(),
             filters,
             used_filters: HashSet::new(),
+            used_overrides: HashSet::new(),
             info: config.info,
             color,
             results: Vec::new(),
@@ -134,11 +139,26 @@ impl Filter {
         // Strict promotes everything to error (and counts the promotions);
         // default badness is computed after promotion, so promoted
         // findings get the E default of 1.
+        //
+        // An overridden finding is not counted as strict-promoted: the
+        // override below is the final word on its level, and counting it
+        // would break the DESIGN §4.6 `printed(E) == promoted` split (a
+        // finding overridden back to W is not a strict error, so the run
+        // exits 65, not 64).
+        let overridden = self.severity_overrides.contains_key(&finding.check);
         if self.strict {
-            if finding.level != Level::Error {
+            if finding.level != Level::Error && !overridden {
                 self.promoted_to_error += 1;
             }
             finding.level = Level::Error;
+        }
+        // Per-finding severity overrides (upstream rpmlint#1335): explicit
+        // user policy, applied after scoring and strict promotion — the
+        // override is the final word on the finding's level. Badness still
+        // follows the scoring table when set, else the level default below.
+        if let Some(level) = self.severity_overrides.get(&finding.check) {
+            self.used_overrides.insert(finding.check.clone());
+            finding.level = *level;
         }
         let badness = badness.unwrap_or(if finding.level == Level::Error { 1 } else { 0 });
         finding.badness = badness;
@@ -292,7 +312,14 @@ impl Filter {
         self.printed_warnings += other.printed_warnings;
         self.printed_infos += other.printed_infos;
         self.used_filters.extend(other.used_filters);
+        self.used_overrides.extend(other.used_overrides);
         self.error_details.extend(other.error_details);
+    }
+
+    /// The `[SeverityOverrides]` names that matched at least one emitted
+    /// finding, for the post-run typo audit.
+    pub fn used_overrides(&self) -> &HashSet<String> {
+        &self.used_overrides
     }
 
     /// The rpmlintrc filter patterns that never matched (for the
@@ -390,6 +417,124 @@ mod tests {
         assert_eq!(f.printed(Level::Error), 1);
         assert_eq!(f.promoted_to_error, 1);
         assert_eq!(f.score, 1); // E default badness 1 after promotion
+    }
+
+    #[test]
+    fn severity_override_downgrades_error_to_warning() {
+        let mut c = cfg();
+        c.severity_overrides
+            .insert("spelling-error".to_string(), Level::Warning);
+        let mut f = Filter::new(&c, Color::for_tty(false)).unwrap();
+        f.add_info(finding("spelling-error", Level::Error, 0));
+        assert_eq!(f.printed(Level::Warning), 1);
+        assert_eq!(f.printed(Level::Error), 0);
+        assert_eq!(f.score, 0); // W default badness 0
+        assert!(f.results()[0].1.starts_with("pkg.src: W: spelling-error"));
+    }
+
+    #[test]
+    fn severity_override_upgrades_warning_to_error() {
+        let mut c = cfg();
+        c.severity_overrides
+            .insert("no-soname".to_string(), Level::Error);
+        let mut f = Filter::new(&c, Color::for_tty(false)).unwrap();
+        f.add_info(finding("no-soname", Level::Warning, 0));
+        assert_eq!(f.printed(Level::Error), 1);
+        assert_eq!(f.score, 1); // E default badness 1
+        assert!(f.results()[0].1.starts_with("pkg.src: E: no-soname"));
+    }
+
+    #[test]
+    fn severity_override_beats_strict_promotion() {
+        let mut c = cfg();
+        c.strict = true;
+        c.severity_overrides
+            .insert("spelling-error".to_string(), Level::Warning);
+        let mut f = Filter::new(&c, Color::for_tty(false)).unwrap();
+        f.add_info(finding("spelling-error", Level::Warning, 0));
+        // Strict promotes, then the override downgrades back: the table is
+        // the final word on the finding's level, and the finding is not
+        // counted as strict-promoted (DESIGN §4.6 exit-code split).
+        assert_eq!(f.promoted_to_error, 0);
+        assert_eq!(f.printed(Level::Warning), 1);
+        assert_eq!(f.printed(Level::Error), 0);
+    }
+
+    #[test]
+    fn strict_promotion_count_skips_overridden_findings() {
+        // The exit-code bug: 2 strict-promoted warnings with one overridden
+        // back must keep printed(E) == promoted_to_error (1 == 1); counting
+        // the overridden finding gave 1 != 2 and the wrong exit code.
+        let mut c = cfg();
+        c.strict = true;
+        c.severity_overrides
+            .insert("second-warning".to_string(), Level::Warning);
+        let mut f = Filter::new(&c, Color::for_tty(false)).unwrap();
+        f.add_info(finding("first-warning", Level::Warning, 0));
+        f.add_info(finding("second-warning", Level::Warning, 0));
+        assert_eq!(f.printed(Level::Error), 1);
+        assert_eq!(f.printed(Level::Warning), 1);
+        assert_eq!(f.promoted_to_error, 1);
+        assert_eq!(f.used_overrides().len(), 1);
+        assert!(f.used_overrides().contains("second-warning"));
+    }
+
+    #[test]
+    fn severity_override_keeps_explicit_scoring_badness() {
+        let mut c = cfg();
+        c.scoring
+            .insert("some-check".to_string(), toml::Value::Integer(50));
+        c.severity_overrides
+            .insert("some-check".to_string(), Level::Warning);
+        let mut f = Filter::new(&c, Color::for_tty(false)).unwrap();
+        f.add_info(finding("some-check", Level::Warning, 0));
+        // scoring forces E, the override returns it to W, explicit badness
+        // 50 stays (scoring still drives the score).
+        assert_eq!(f.printed(Level::Warning), 1);
+        assert_eq!(f.score, 50);
+    }
+
+    #[test]
+    fn severity_override_to_error_keeps_zero_scoring_badness() {
+        // `Scoring(0)` + override to E (DESIGN §4.9): the finding prints as a
+        // genuine error for the §4.6 split, but scoring still drives the
+        // badness, so it scores nothing.
+        let mut c = cfg();
+        c.scoring
+            .insert("zero-badness".to_string(), toml::Value::Integer(0));
+        c.severity_overrides
+            .insert("zero-badness".to_string(), Level::Error);
+        let mut f = Filter::new(&c, Color::for_tty(false)).unwrap();
+        f.add_info(finding("zero-badness", Level::Warning, 0));
+        assert_eq!(f.printed(Level::Error), 1);
+        assert_eq!(f.printed(Level::Warning), 0);
+        assert_eq!(f.score, 0);
+        // An override is not a strict promotion, even when it raises the level.
+        assert_eq!(f.promoted_to_error, 0);
+    }
+
+    #[test]
+    fn filters_match_the_overridden_level() {
+        // Suppression runs after the override (DESIGN §4.9): a `Filters`
+        // regex matching the post-override level letter filters the finding,
+        // while one matching the pre-override letter does not.
+        let mut c = cfg();
+        c.severity_overrides
+            .insert("downgraded".to_string(), Level::Warning);
+        c.filters = vec!["W: downgraded".to_string()];
+        let mut f = Filter::new(&c, Color::for_tty(false)).unwrap();
+        f.add_info(finding("downgraded", Level::Error, 0));
+        assert_eq!(f.filtered_out, 1);
+        assert_eq!(f.printed(Level::Warning), 0);
+
+        let mut c = cfg();
+        c.severity_overrides
+            .insert("downgraded".to_string(), Level::Warning);
+        c.filters = vec!["E: downgraded".to_string()];
+        let mut f = Filter::new(&c, Color::for_tty(false)).unwrap();
+        f.add_info(finding("downgraded", Level::Error, 0));
+        assert_eq!(f.filtered_out, 0);
+        assert_eq!(f.printed(Level::Warning), 1);
     }
 
     #[test]
