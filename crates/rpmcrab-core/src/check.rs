@@ -112,6 +112,24 @@ pub trait Check: Send {
     /// The check's registry name (the Python module name, e.g. `FilesCheck`).
     fn name(&self) -> &'static str;
 
+    /// The highest severity this check can emit. `--errors-only` drops every
+    /// check whose maximum is below `Error`, so post-build runs skip
+    /// warning-only checks entirely (upstream rpmlint#134). The default is
+    /// `Error` (always run); warning-only checks override this. The bound is
+    /// an upper bound over the check's `add_info` call sites — a check that
+    /// can never emit an error must not claim otherwise.
+    ///
+    /// The bound is static (pre-scoring): `--errors-only` is applied at check
+    /// load time, before any finding exists, so runtime promotions a finding
+    /// may receive at emit time (`Scoring>0`, severity overrides) are
+    /// invisible to the filter — a finding that promotion would have raised
+    /// to E on a skipped check never runs. `--strict` promotes every finding
+    /// to E at emit time, so under `--strict` the effective maximum of every
+    /// check is Error and the filter is disabled (see `errors_only_skips`).
+    fn max_severity(&self) -> Level {
+        Level::Error
+    }
+
     /// `AbstractCheck.check`: dispatch on whether the package is a source
     /// package. Both hooks default to doing nothing, like the reference.
     fn check(&mut self, pkg: &Pkg, config: &Config, out: &mut Filter) {
@@ -298,6 +316,34 @@ pub fn load(config: &Config, selected: Option<&str>) -> Vec<Box<dyn Check>> {
     load_with(config, selected, |name| build(name, config))
 }
 
+/// Whether `--errors-only` (upstream rpmlint#134) drops this check: a static
+/// pre-scoring bound on the check's declared [`Check::max_severity`].
+///
+/// Runtime promotions (`Scoring>0`, severity overrides) apply per finding at
+/// emit time and are invisible here — deciding them would need every check to
+/// declare its emittable finding names, so the filter stays a static bound
+/// and the limitation is documented (`docs/DESIGN.md` §4.10, parity ledger).
+/// `--strict` is the exception it can see: strict promotes every finding to E
+/// at emit time, so under `--strict` no check is warning-only and the filter
+/// is disabled.
+fn errors_only_skips(check: &dyn Check, config: &Config) -> bool {
+    config.errors_only && !config.strict && check.max_severity() != Level::Error
+}
+
+/// How many checks `--errors-only` would drop from this selection. The CLI
+/// warns instead of silently running nothing when the whole selection is
+/// dropped.
+pub fn errors_only_dropped(config: &Config, selected: Option<&str>) -> usize {
+    let selected: Vec<&str> = selected.map(|s| s.split(',').collect()).unwrap_or_default();
+    config
+        .checks
+        .iter()
+        .filter(|name| selected.is_empty() || selected.contains(&name.as_str()))
+        .filter_map(|name| build(name, config))
+        .filter(|check| errors_only_skips(check.as_ref(), config))
+        .count()
+}
+
 /// [`load`] with an injectable factory, so the ordering, deduplication and
 /// `--checks` narrowing are testable before any real check exists.
 pub fn load_with(
@@ -315,6 +361,11 @@ pub fn load_with(
             continue;
         }
         if let Some(check) = make(name) {
+            // `--errors-only` (upstream rpmlint#134): drop warning-only
+            // checks so they never run; see `errors_only_skips`.
+            if errors_only_skips(check.as_ref(), config) {
+                continue;
+            }
             built.push(check);
         }
     }
@@ -351,6 +402,17 @@ impl Check for SyntheticCheck {
         self.name
     }
 
+    fn max_severity(&self) -> Level {
+        // Conservative on empty: a check with no known findings still runs.
+        if self.findings.is_empty() || self.findings.iter().any(|(l, _, _)| *l == Level::Error) {
+            Level::Error
+        } else if self.findings.iter().any(|(l, _, _)| *l == Level::Warning) {
+            Level::Warning
+        } else {
+            Level::Info
+        }
+    }
+
     fn check_binary(&mut self, _pkg: &Pkg, _config: &Config, out: &mut Filter) {
         for (level, check, details) in &self.findings {
             out.add_info(Finding {
@@ -379,6 +441,139 @@ mod tests {
 
     fn always(_name: &str) -> Option<Box<dyn Check>> {
         None
+    }
+
+    #[test]
+    fn warning_only_checks_report_warning_max_severity() {
+        // Every `add_info` call site in these four passes `Level::Warning`
+        // (verified by audit); the annotation must match or `--errors-only`
+        // would wrongly keep them.
+        let config = Config::default();
+        assert_eq!(
+            crate::checks::bashisms::BashismsCheck::new(&config).max_severity(),
+            Level::Warning
+        );
+        assert_eq!(
+            crate::checks::config_files::ConfigFilesCheck::new(&config).max_severity(),
+            Level::Warning
+        );
+        assert_eq!(
+            crate::checks::fhs::FHSCheck::new(&config).max_severity(),
+            Level::Warning
+        );
+        assert_eq!(
+            crate::checks::tmpfiles::TmpFilesCheck::new(&config).max_severity(),
+            Level::Warning
+        );
+    }
+
+    #[test]
+    fn max_severity_defaults_to_error() {
+        let c = SyntheticCheck::new("x", "p", None, vec![]);
+        // empty findings: conservative default, the check still runs.
+        assert_eq!(c.max_severity(), Level::Error);
+    }
+
+    #[test]
+    fn synthetic_max_severity_follows_findings() {
+        let w = SyntheticCheck::new("w", "p", None, vec![(Level::Warning, "w-check", vec![])]);
+        assert_eq!(w.max_severity(), Level::Warning);
+        let i = SyntheticCheck::new("i", "p", None, vec![(Level::Info, "i-check", vec![])]);
+        assert_eq!(i.max_severity(), Level::Info);
+        let mixed = SyntheticCheck::new(
+            "m",
+            "p",
+            None,
+            vec![
+                (Level::Info, "i-check", vec![]),
+                (Level::Warning, "w-check", vec![]),
+            ],
+        );
+        assert_eq!(mixed.max_severity(), Level::Warning);
+    }
+
+    fn synthetic_factory() -> impl FnMut(&str) -> Option<Box<dyn Check>> {
+        |name| match name {
+            "ErrCheck" => Some(Box::new(SyntheticCheck::new(
+                "ErrCheck",
+                "p",
+                None,
+                vec![(Level::Error, "e-check", vec![])],
+            )) as Box<dyn Check>),
+            "WarnCheck" => Some(Box::new(SyntheticCheck::new(
+                "WarnCheck",
+                "p",
+                None,
+                vec![(Level::Warning, "w-check", vec![])],
+            )) as Box<dyn Check>),
+            "InfoCheck" => Some(Box::new(SyntheticCheck::new(
+                "InfoCheck",
+                "p",
+                None,
+                vec![(Level::Info, "i-check", vec![])],
+            )) as Box<dyn Check>),
+            _ => None,
+        }
+    }
+
+    #[test]
+    fn errors_only_drops_warning_only_checks() {
+        let mut config = cfg_with(&["ErrCheck", "WarnCheck", "InfoCheck"]);
+        config.errors_only = true;
+        let built = load_with(&config, None, synthetic_factory());
+        let names: Vec<&str> = built.iter().map(|c| c.name()).collect();
+        assert_eq!(names, vec!["ErrCheck"]);
+    }
+
+    #[test]
+    fn errors_only_off_keeps_everything() {
+        let config = cfg_with(&["ErrCheck", "WarnCheck"]);
+        assert!(!config.errors_only);
+        let built = load_with(&config, None, synthetic_factory());
+        assert_eq!(built.len(), 2);
+    }
+
+    #[test]
+    fn strict_disables_errors_only_filter() {
+        // `--strict` promotes every finding to E at emit time, so the
+        // effective max severity of every check is Error: `--errors-only`
+        // must not drop anything. Mutation guard: removing the
+        // `!config.strict` clause in `errors_only_skips` fails this.
+        let mut config = cfg_with(&["ErrCheck", "WarnCheck", "InfoCheck"]);
+        config.errors_only = true;
+        config.strict = true;
+        let built = load_with(&config, None, synthetic_factory());
+        assert_eq!(built.len(), 3);
+    }
+
+    #[test]
+    fn errors_only_dropped_counts_real_checks() {
+        // `errors_only_dropped` builds through the real registry, so it
+        // needs real check names (the synthetic factory above is invisible
+        // to it).
+        let mut config = cfg_with(&["TmpFilesCheck", "TagsCheck"]);
+        config.errors_only = true;
+        assert_eq!(errors_only_dropped(&config, None), 1);
+        assert_eq!(errors_only_dropped(&config, Some("TagsCheck")), 0);
+        assert_eq!(errors_only_dropped(&config, Some("NopeCheck")), 0);
+        config.strict = true;
+        assert_eq!(errors_only_dropped(&config, None), 0);
+    }
+
+    #[test]
+    fn scoring_promotion_does_not_rescue_a_skipped_check() {
+        // The `--errors-only` bound is static (pre-scoring): a `Scoring`
+        // entry promoting the warning finding to E is invisible at load
+        // time, so the check is still skipped. Documented in
+        // `docs/DESIGN.md` §4.10; pinned here so the limitation cannot
+        // silently change shape.
+        let mut config = cfg_with(&["WarnCheck"]);
+        config.errors_only = true;
+        config
+            .scoring
+            .insert("w-check".to_string(), toml::Value::Integer(50));
+        let built = load_with(&config, None, synthetic_factory());
+        assert!(built.is_empty());
     }
 
     #[test]
